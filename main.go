@@ -1,134 +1,120 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"embed"
-	"fmt"
+	"errors"
 	"html/template"
 	"log"
 	"net/http"
+	"os"
+	"strings"
+	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 )
 
 //go:embed templates/*.html
 var templateFiles embed.FS
+
 type Article struct {
-	Id uint16
-	Title, Anons, FullText string
+	ID       string
+	Title    string
+	Anons    string
+	FullText string
 }
 
-func create(w http.ResponseWriter, r *http.Request) {
-	t, err := template.ParseFS(templateFiles, "templates/create.html", "templates/head.html", "templates/footer.html")
+type articleStore interface {
+	List(context.Context) ([]Article, error)
+	Get(context.Context, string) (Article, error)
+	Create(context.Context, Article) error
+	Close() error
+}
+
+func renderTemplate(w http.ResponseWriter, filename, name string, data any) {
+	t, err := template.ParseFS(templateFiles, filename, "templates/head.html", "templates/footer.html")
 	if err != nil {
-		log.Printf("parse create template: %v", err)
+		log.Printf("parse %s template: %v", name, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	if err := t.ExecuteTemplate(w, "create", nil); err != nil {
-		log.Printf("render create template: %v", err)
+	if err := t.ExecuteTemplate(w, name, data); err != nil {
+		log.Printf("render %s template: %v", name, err)
 	}
 }
 
-func index(w http.ResponseWriter, r *http.Request) {
-	t, err := template.ParseFS(templateFiles, "templates/index.html", "templates/head.html", "templates/footer.html")
-	if err != nil {
-		log.Printf("parse index template: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/golang")
-		if err != nil {
-			panic(err)
-		}
-		defer db.Close()
-
-	res, err:= db.Query("SELECT * FROM articles")
-	if err != nil {
-		panic(err)
-	}
-	var posts = []Article{}
-	for res.Next(){
-		var article Article
-		err = res.Scan(&article.Id, &article.Title, &article.Anons, &article.FullText )
-		if err != nil {
-		panic(err)
-		}
-		posts = append(posts, article)
-	}
-
-
-	if err := t.ExecuteTemplate(w, "index", posts); err != nil {
-		log.Printf("render index template: %v", err)
-	}
-}
-func save_article(w http.ResponseWriter, r *http.Request) {
-	title := r.FormValue("title")
-	anons := r.FormValue("anons")
-	full_text := r.FormValue("full_text")
-
-	if title == "" || anons == "" || full_text == "" {
-		fmt.Fprintf(w, "Incorrect data")
-	}else{
-
-		db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/golang")
-		if err != nil {
-			panic(err)
-		}
-		defer db.Close()
-
-		insert, err := db.Query(fmt.Sprintf("INSERT INTO articles (title, anons, full_text) VALUES ('%s','%s','%s')", title, anons, full_text))
-		if err != nil {
-			panic(err)
-		}
-		defer insert.Close()
-		http.Redirect(w,r, "/", http.StatusSeeOther)
-	}
-}
-func show_post(w http.ResponseWriter, r *http.Request){
-	t, err := template.ParseFS(templateFiles, "templates/post.html", "templates/head.html", "templates/footer.html")
-	if err != nil {
-		log.Printf("parse index template: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	db, err := sql.Open("mysql", "root:root@tcp(127.0.0.1:3306)/golang")
-		if err != nil {
-			panic(err)
-		}
-		defer db.Close()
-    vars := mux.Vars(r)
-	w.WriteHeader(http.StatusOK)
-	res, err:= db.Query(fmt.Sprintf("SELECT * FROM articles WHERE id = '%s'", vars["id"]))
-	if err != nil {
-		panic(err)
-	}
-	var article Article
-	for res.Next(){
-		
-		err = res.Scan(&article.Id, &article.Title, &article.Anons, &article.FullText )
-		if err != nil {
-		panic(err)
-		}
-	}
-	if err := t.ExecuteTemplate(w, "post", article); err != nil {
-		log.Printf("render post template: %v", err)
-	}
-}
-func handleFunc() error {
+func newRouter(articles articleStore) http.Handler {
 	rtr := mux.NewRouter()
-	rtr.HandleFunc("/", index).Methods("GET")
-	rtr.HandleFunc("/create", create).Methods("GET")
-	rtr.HandleFunc("/save_article", save_article).Methods("POST")
-	rtr.HandleFunc("/post/{id:[0-9]+}", show_post).Methods("GET")
-	http.Handle("/", rtr)
-	log.Println("serving on http://localhost:8081")
-	return http.ListenAndServe(":8081", nil)
+	rtr.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		posts, err := articles.List(r.Context())
+		if err != nil {
+			log.Printf("list articles: %v", err)
+			http.Error(w, "Unable to load articles", http.StatusInternalServerError)
+			return
+		}
+		renderTemplate(w, "templates/index.html", "index", posts)
+	}).Methods(http.MethodGet)
+	rtr.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
+		renderTemplate(w, "templates/create.html", "create", nil)
+	}).Methods(http.MethodGet)
+	rtr.HandleFunc("/save_article", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Invalid form data", http.StatusBadRequest)
+			return
+		}
+
+		article := Article{
+			Title:    strings.TrimSpace(r.FormValue("title")),
+			Anons:    strings.TrimSpace(r.FormValue("anons")),
+			FullText: strings.TrimSpace(r.FormValue("full_text")),
+		}
+		if article.Title == "" || article.Anons == "" || article.FullText == "" {
+			http.Error(w, "All article fields are required", http.StatusBadRequest)
+			return
+		}
+		if err := articles.Create(r.Context(), article); err != nil {
+			log.Printf("save article: %v", err)
+			http.Error(w, "Unable to save article", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}).Methods(http.MethodPost)
+	rtr.HandleFunc("/post/{id:[a-fA-F0-9]+}", func(w http.ResponseWriter, r *http.Request) {
+		article, err := articles.Get(r.Context(), mux.Vars(r)["id"])
+		if errors.Is(err, errArticleNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			log.Printf("get article: %v", err)
+			http.Error(w, "Unable to load article", http.StatusInternalServerError)
+			return
+		}
+		renderTemplate(w, "templates/post.html", "post", article)
+	}).Methods(http.MethodGet)
+	return rtr
 }
 
 func main() {
-	if err := handleFunc(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	articles, err := openArticleStore(ctx)
+	cancel()
+	if err != nil {
 		log.Fatal(err)
+	}
+	defer func() {
+		if err := articles.Close(); err != nil {
+			log.Printf("close article database: %v", err)
+		}
+	}()
+
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8081"
+	}
+	addr := ":" + port
+	log.Printf("serving on http://localhost:%s", port)
+	if err := http.ListenAndServe(addr, newRouter(articles)); err != nil {
+		log.Printf("HTTP server stopped: %v", err)
 	}
 }

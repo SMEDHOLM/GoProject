@@ -1,0 +1,24 @@
+{{define "index"}}
+
+{{template "head"}}
+      <main class="px-3">
+        <h1>Cover your page.</h1>
+        <p class="fs-5 fw-light">
+          {{range .}}
+          <div class="alert alert-danger">
+            <h2>{{.Title}}</h2>
+            <p>{{.Anons}}</p>
+            <a href="/post/{{.Id}}" class="btn btn-danger">Read</a>
+          </div>
+
+          {{else}}
+          <p class="lead"> No posts</p>
+
+          {{end}}
+        </p>
+        <p class="fs-5 fw-light">
+          <a href="#" class="btn btn-light btn-lg fw-bold">Learn more</a>
+        </p>
+      </main>
+{{template "footer"}}
+{{end}}
